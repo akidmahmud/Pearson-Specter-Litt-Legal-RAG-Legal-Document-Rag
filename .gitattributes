@@ -1,0 +1,67 @@
+# ── Default: auto-detect text and normalise line endings to LF in the repo ────
+* text=auto eol=lf
+
+# ── Python ────────────────────────────────────────────────────────────────────
+*.py     text eol=lf
+*.pyi    text eol=lf
+*.txt    text eol=lf
+*.cfg    text eol=lf
+*.ini    text eol=lf
+*.toml   text eol=lf
+
+# ── Web / Frontend ────────────────────────────────────────────────────────────
+*.js     text eol=lf
+*.jsx    text eol=lf
+*.ts     text eol=lf
+*.tsx    text eol=lf
+*.css    text eol=lf
+*.html   text eol=lf
+*.json   text eol=lf
+*.svg    text eol=lf
+
+# ── Config / Docs ─────────────────────────────────────────────────────────────
+*.md          text eol=lf
+*.yml         text eol=lf
+*.yaml        text eol=lf
+*.env         text eol=lf
+Dockerfile    text eol=lf
+.dockerignore text eol=lf
+.gitignore    text eol=lf
+.gitattributes text eol=lf
+
+# ── Shell scripts — must be LF or they break on Linux/macOS ──────────────────
+*.sh   text eol=lf
+*.bash text eol=lf
+
+# ── Windows batch — keep CRLF ─────────────────────────────────────────────────
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+*.ps1  text eol=crlf
+
+# ── Binary files — never diff or mangle line endings ─────────────────────────
+*.pdf    binary
+*.png    binary
+*.jpg    binary
+*.jpeg   binary
+*.gif    binary
+*.ico    binary
+*.woff   binary
+*.woff2  binary
+*.ttf    binary
+*.otf    binary
+*.eot    binary
+*.zip    binary
+*.gz     binary
+*.tar    binary
+*.pt     binary
+*.pth    binary
+*.onnx   binary
+*.pkl    binary
+*.bin    binary
+*.db     binary
+
+# ── GitHub Linguist — mark generated / vendored files ────────────────────────
+frontend/build/**        linguist-generated=true
+static/**                linguist-generated=true
+package-lock.json        linguist-generated=true
+frontend/package-lock.json linguist-generated=true
