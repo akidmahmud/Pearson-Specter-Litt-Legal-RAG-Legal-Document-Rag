@@ -287,7 +287,7 @@ With routing:
 ### Upload — PDF (native text)
 
 **Input:** A born-digital legal judgment PDF
-
+**Sample Data Link:** https://www.supremecourt.gov.bd/web/?page=bulletin.php&menu=10&lang=
 **Backend log:**
 ```
 Processing: judgment_2024.pdf
