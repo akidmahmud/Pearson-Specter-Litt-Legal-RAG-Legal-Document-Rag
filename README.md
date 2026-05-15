@@ -192,7 +192,6 @@ Upload
   Answer + Sources + Confidence
 ```
 
-**Full detail:** see `ARCHITECTURE.txt`
 
 ---
 
