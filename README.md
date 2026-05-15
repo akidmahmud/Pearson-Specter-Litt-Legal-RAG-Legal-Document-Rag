@@ -147,6 +147,8 @@ docker run -p 7860:7860 \
 
 ## Architecture Overview
 
+### Ingestion Pipeline
+
 ```
 Upload
   │
@@ -174,23 +176,77 @@ Upload
           ▼
   Embed (all-MiniLM-L6-v2, 384-dim) + Index (ChromaDB + BM25)
   Stored metadata includes: ocr_confidence, has_uncertain_spans
-          │
-         ─┴──────────────────── RETRIEVAL ────────────────────────────────
-          │
+```
+
+### Query Pipeline
+
+Every query is classified before retrieval. The task type determines the retrieval
+breadth, the number of chunks sent to the LLM, and the answer generator used.
+
+```
+User Question
+      │
+      ▼
+  Task Router  (_classify_task)
+      │
+      ├─ "summarize", "overview", "key procedures",
+      │   "what are the", "describe", "extract", …
+      │         → document_understanding
+      │
+      ├─ "compare", "vs", "difference between", …
+      │         → comparison
+      │
+      └─ everything else
+                → retrieval_qa
+      │
+      ▼
+┌─────────────────────────────────┬──────────────────────────┐
+│     document_understanding      │       retrieval_qa /     │
+│         & comparison            │        comparison        │
+│                                 │                          │
+│  Retrieve 30 candidates         │  Retrieve 20 candidates  │
+│  Rerank → top 12 chunks         │  Rerank → top 8 chunks   │
+│                                 │                          │
+│  Single doc ≤ 20 chunks?        │                          │
+│  ├─ YES → Direct Analysis       │                          │
+│  │   Full text passed to LLM    │                          │
+│  │   No retrieval noise         │                          │
+│  └─ NO  → Synthesis Answer      │  Citation-strict Answer  │
+│      Aggregate across 12 chunks │  Cite exact excerpts     │
+│      Synthesis-focused prompt   │  Refuse if no evidence   │
+└─────────────────────────────────┴──────────────────────────┘
+      │                                       │
+      ▼                                       ▼
   Hybrid Search  →  Dense (ChromaDB cosine ANN) + Sparse (BM25Okapi)
-          │
+      │
   RRF Merge  →  score = Σ 1 / (60 + rank)
-          │
+      │
   Confidence Re-rank  →  final_score = similarity × ocr_confidence
-          │
+      │
   Cross-encoder Rerank  →  BAAI/bge-reranker-base
-          │
+      │
   Few-shot Injection  →  top-2 operator-corrected examples (BM25, score ≥ 0.5)
-          │
-  GLM-5.1 Generation  →  quality tier labelled per excerpt, hedging enforced
-          │
+      │
+  GLM-5.1 Generation  →  generator selected by task type (see above)
+      │
   Answer + Sources + Confidence
 ```
+
+### Why Task Routing Matters
+
+Without routing, every question — including "summarize this document" — was forced
+through the retrieval path, which returns 3–5 chunks and asks the LLM to cite exact
+sentences. A broad question over a 300-page document will never find sufficient
+evidence in 5 chunks, so the LLM would respond with "not enough information."
+
+With routing:
+- **Summarize / overview questions** use a synthesis prompt over 12 chunks and are
+  told to aggregate across the document rather than cite isolated sentences.
+- **Small documents and images** (≤ 20 chunks) bypass retrieval entirely — the full
+  extracted text is passed to the LLM, eliminating retrieval noise for single-page
+  images and short PDFs.
+- **Exact fact lookup questions** continue to use the strict citation path, which
+  refuses to hallucinate when evidence is absent.
 
 
 ---

@@ -213,7 +213,7 @@ class SystemStatus(BaseModel):
 class QARequest(BaseModel):
     question: str
     session_id: Optional[str] = None
-    num_results: int = 5
+    num_results: int = 8
 
 class QAResponse(BaseModel):
     session_id: str
@@ -612,7 +612,7 @@ def generate_answer(question: str, results: List[dict]) -> str:
     """Generate AI answer using GLM-5.1"""
     try:
         context_parts = []
-        for idx, r in enumerate(results[:3], 1):
+        for idx, r in enumerate(results[:8], 1):
             source_location = f"{r.get('filename', 'Unknown')}:chunk_{r.get('chunk_index', 0)}"
             context_parts.append(f"[Source {idx}: {source_location}]\n{r['text']}")
 
@@ -622,7 +622,8 @@ def generate_answer(question: str, results: List[dict]) -> str:
 
 STRICT RULES:
 - Answer using ONLY information present in the excerpts. Do NOT use outside knowledge.
-- If the excerpts do not contain enough information to answer, say exactly: "The uploaded documents do not contain sufficient information to answer this question."
+- If the excerpts contain relevant information, summarize and cite it even if the answer is partial.
+- Only say "The uploaded documents do not contain sufficient information to answer this question." if the excerpts contain NO relevant information at all.
 - Cite the source tag (e.g. [Source 1]) for every factual claim you make.
 - Never guess, infer beyond the text, or fill gaps from general legal knowledge.
 
@@ -855,11 +856,22 @@ async def question_answer(request: QARequest, req: Request):
             "timestamp": datetime.now().isoformat()
         })
 
-        # Search: retrieve broad candidates, then rerank
-        raw_results = vector_store.search(request.question, limit=20)
+        # Classify task — determines retrieval breadth and answer generator
+        task_type = _classify_task(request.question)
+
+        # Search: broader candidate pool for synthesis/comparison tasks
+        search_limit = 30 if task_type in ("document_understanding", "comparison") else 20
+        raw_results = vector_store.search(request.question, limit=search_limit)
+
+        # Rerank: more results kept for synthesis tasks
+        top_k = (
+            min(12, request.num_results * 2)
+            if task_type in ("document_understanding", "comparison")
+            else request.num_results
+        )
         results = (
-            reranker.rerank(request.question, raw_results, top_k=request.num_results)
-            if reranker else raw_results[:request.num_results]
+            reranker.rerank(request.question, raw_results, top_k=top_k)
+            if reranker else raw_results[:top_k]
         )
 
         # Format sources
@@ -874,13 +886,33 @@ async def question_answer(request: QARequest, req: Request):
                 "source_location": f"{result.get('filename', '')}:chunk_{result.get('chunk_index', 0)}"
             })
 
-        # Generate AI answer
+        # Generate AI answer — route to appropriate generator
         ai_answer = "Unable to generate answer from available documents"
         confidence = 0.0
 
         if llm_client and results:
             examples = feedback_store.get_relevant_examples(request.question) if feedback_store else []
-            ai_answer = generate_qa_answer(request.question, results, examples=examples)
+
+            if task_type == "document_understanding":
+                # Small / single-document: direct analysis (no retrieval noise).
+                # Large / multi-document: synthesis over top-12 retrieved chunks.
+                total_chunks = vector_store.get_document_count()
+                unique_docs = len({r.get('filename', '') for r in results if r.get('filename')})
+                if unique_docs == 1 and total_chunks <= 20:
+                    doc_text, doc_filename, doc_meta = _load_document_for_direct_analysis()
+                    if doc_text.strip():
+                        ai_answer = generate_direct_analysis_answer(
+                            request.question, doc_text, doc_filename,
+                            doc_meta.get("avg_confidence", 1.0),
+                        )
+                    else:
+                        ai_answer = generate_synthesis_answer(request.question, results, examples=examples)
+                else:
+                    ai_answer = generate_synthesis_answer(request.question, results, examples=examples)
+            else:
+                # retrieval_qa and comparison both use the citation-strict path
+                ai_answer = generate_qa_answer(request.question, results, examples=examples)
+
             confidence = sum(s['relevance_score'] for s in sources) / len(sources) if sources else 0.0
 
         # Add assistant response
@@ -923,11 +955,161 @@ def _ocr_confidence_label(conf: float) -> str:
     return "OCR quality: VERY LOW — treat all extracted text as potentially unreliable"
 
 
+# ── Task routing ───────────────────────────────────────────────────────────────
+
+_SUMMARIZE_TERMS = {
+    "summarize", "summarise", "summary", "overview", "describe", "explain",
+    "outline", "brief", "highlight", "extract", "analyze", "analyse",
+    "key procedures", "main procedures", "key points", "main points",
+    "what does this", "what are the", "tell me about", "what is in",
+    "contents", "procedure", "procedures",
+}
+_COMPARE_TERMS = {
+    "compare", "contrast", "difference between", "vs ", " versus ",
+    "compared to", "similarities", "differences",
+}
+
+
+def _classify_task(question: str) -> str:
+    """Route a user query to document_understanding, comparison, or retrieval_qa."""
+    q = question.lower()
+    if any(t in q for t in _COMPARE_TERMS):
+        return "comparison"
+    if any(t in q for t in _SUMMARIZE_TERMS):
+        return "document_understanding"
+    return "retrieval_qa"
+
+
+def _load_document_for_direct_analysis() -> tuple:
+    """
+    Re-reads the most recently uploaded file from disk.
+    Returns (text, filename, ocr_meta).
+    Used for direct analysis that bypasses vector retrieval.
+    """
+    if not DATA_DIR.exists():
+        return "", "", {}
+    files = [f for f in DATA_DIR.iterdir() if f.suffix.lower() in ALLOWED_EXTENSIONS]
+    if not files:
+        return "", "", {}
+    target = files[0] if len(files) == 1 else max(files, key=lambda f: f.stat().st_mtime)
+    ext = target.suffix.lower()
+    try:
+        if ext in {'.pdf', '.png', '.jpg', '.jpeg'}:
+            text, meta = pdf_processor.extract_with_confidence(str(target))
+        else:
+            text, meta = _extract_text_from_doc(str(target))
+        return text, target.name, meta
+    except Exception as e:
+        print(f"Direct load error ({target.name}): {e}")
+        return "", "", {}
+
+
+def generate_direct_analysis_answer(question: str, doc_text: str, filename: str, avg_conf: float) -> str:
+    """
+    Direct document analysis — passes full extracted text to the LLM, no retrieval.
+    Used when the document is small enough to fit in context (≤ 8 000 words).
+    """
+    try:
+        words = doc_text.split()
+        if len(words) > 8000:
+            trimmed = " ".join(words[:8000])
+            trimmed += f"\n\n[Document continues — showing first 8 000 of {len(words)} words]"
+        else:
+            trimmed = doc_text
+
+        conf_label = _ocr_confidence_label(avg_conf)
+        hedge = (
+            "\nIMPORTANT: OCR confidence is low — hedge uncertain readings appropriately."
+            if avg_conf < 0.70 else ""
+        )
+
+        prompt = f"""You are a legal document analyst at Pearson Specter Litt.
+
+Analyze the following document and answer the question comprehensively.
+
+File: {filename}
+OCR Quality: {conf_label}{hedge}
+
+--- DOCUMENT ---
+{trimmed}
+--- END ---
+
+Question: {question}
+
+Provide a thorough, structured answer based entirely on the document content above."""
+
+        response = llm_client.chat.completions.create(
+            model="glm-5.1",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            max_tokens=2500,
+        )
+        content = response.choices[0].message.content
+        if not content:
+            content = getattr(response.choices[0].message, "reasoning_content", "") or "No answer generated."
+        return content
+    except Exception as e:
+        return f"Error generating direct analysis: {str(e)}"
+
+
+def generate_synthesis_answer(question: str, results: List[dict], examples: List[dict] = None) -> str:
+    """
+    Synthesis-focused answer for broad document understanding queries.
+    Uses up to 12 chunks and asks the model to aggregate across them
+    rather than cite individual sentences.
+    """
+    try:
+        context_parts = []
+        for idx, r in enumerate(results[:12], 1):
+            case_name = r.get('case_name', '')
+            case_info = f" ({case_name})" if case_name else ""
+            context_parts.append(f"[{idx}]{case_info}\n{r.get('text', '')}")
+        context = "\n\n".join(context_parts)
+
+        few_shot = ""
+        if examples:
+            few_shot = "OPERATOR-APPROVED EXAMPLES:\n\n"
+            for i, ex in enumerate(examples, 1):
+                few_shot += f"Q: {ex['question']}\nA: {ex['edited_draft'][:500]}\n\n"
+            few_shot += "---\n\n"
+
+        prompt = f"""{few_shot}You are a legal document analyst at Pearson Specter Litt.
+
+Using the excerpts below (sampled from across the document), provide a comprehensive and well-structured answer.
+
+RULES:
+- Synthesize information across all excerpts — build a coherent picture, not isolated quotes.
+- Cite [n] for specific claims.
+- If some aspects of the question are not fully covered by the excerpts, note this briefly, then continue with what is available.
+- Use numbered lists or short headers when enumerating multiple items.
+- Be thorough — the user wants broad document understanding, not a single fact lookup.
+
+Document Excerpts:
+{context}
+
+Question: {question}
+
+Answer:"""
+
+        response = llm_client.chat.completions.create(
+            model="glm-5.1",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_tokens=2500,
+        )
+        content = response.choices[0].message.content
+        if not content:
+            content = getattr(response.choices[0].message, "reasoning_content", "") or "No answer generated."
+        return content
+    except Exception as e:
+        return f"Error generating synthesis answer: {str(e)}"
+
+
 def generate_qa_answer(question: str, results: List[dict], examples: List[dict] = None) -> str:
     """Generate a confidence-aware Q&A answer using GLM-5.1."""
     try:
         context_parts = []
-        for idx, r in enumerate(results[:3], 1):
+        for idx, r in enumerate(results[:8], 1):
             case_name = r.get('case_name', '')
             case_info = f" ({case_name})" if case_name else ""
             ocr_conf = float(r.get('ocr_confidence', 1.0))
@@ -963,7 +1145,8 @@ STRICT RULES:
 - Answer using ONLY information present in the excerpts. Do NOT use outside knowledge.
 - For HIGH/ACCEPTABLE excerpts: cite directly (e.g. "As stated in [1]...").
 - For LOW/VERY LOW excerpts: acknowledge the uncertainty explicitly before citing.
-- If excerpts do not contain sufficient information, say exactly: "The uploaded documents do not contain sufficient information to answer this question."
+- If the excerpts contain relevant information, summarize and cite it even if incomplete — do NOT refuse to answer just because not every detail is covered.
+- Only say "The uploaded documents do not contain sufficient information to answer this question." if the excerpts contain NO information relevant to the question whatsoever.
 - Never infer beyond the text or fill gaps from general legal knowledge.
 - Be concise and precise — aim for 2–4 paragraphs.
 
