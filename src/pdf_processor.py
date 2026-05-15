@@ -163,7 +163,7 @@ class PDFProcessor:
 
                 # detail=1 → [(bbox, text, confidence), ...]
                 results = self._ocr_reader.readtext(
-                    img if isinstance(img, type(img)) else img,
+                    np.array(img),
                     detail=1,
                     paragraph=False,
                 )
