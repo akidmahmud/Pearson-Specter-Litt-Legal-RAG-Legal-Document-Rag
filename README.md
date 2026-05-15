@@ -2,6 +2,8 @@
 
 A production-grade Retrieval-Augmented Generation system for querying legal documents through a conversational interface. OCR output is treated as probabilistic evidence — every extracted span carries a confidence score that flows through ingestion, retrieval, and generation.
 
+
+Live HF link: https://huggingface.co/spaces/akidmahmud2021/Pearson_Specter_Litt_Legal_RAG
 ---
 
 ## Table of Contents
